@@ -5,13 +5,16 @@ from jes_species_info import SpeciesInfo
 from jes_dataviz import drawAllGraphs
 import time
 import random
+import logging
 
 class Sim:
     def __init__(self, _c_count, _stabilization_time, _trial_time, _beat_time,
     _beat_fade_time, _c_dim, _beats_per_cycle, _node_coor_count,
     _y_clips, _ground_friction_coef, _gravity_acceleration_coef,
     _calming_friction_coef, _typical_friction_coef, _muscle_coef,
-    _traits_per_box, _traits_extra, _mutation_rate, _big_mutation_rate, _UNITS_PER_METER):
+    _traits_per_box, _traits_extra, _mutation_rate, _big_mutation_rate, _UNITS_PER_METER, logger=None):
+        self.logger = logger or logging.getLogger(__name__)
+
         self.c_count = _c_count #creature count
         self.species_count = _c_count #species count
         self.stabilization_time = _stabilization_time
@@ -48,12 +51,13 @@ class Sim:
         self.prominent_species = []
         self.ui = None
         self.last_gen_run_time = -1
+        self.creature_generations = {}
         
     def initializeUniverse(self):
         self.creatures = [[None]*self.c_count]
         for c in range(self.c_count):
             self.creatures[0][c] = self.createNewCreature(c)
-            self.species_info.append(SpeciesInfo(self,self.creatures[0][c], None))
+            self.species_info.append(SpeciesInfo(self,self.creatures[0][c], None, generation=0))
             
         # We want to make sure that all creatures, even in their
         # initial state, are in calm equilibrium. They shouldn't
@@ -65,9 +69,11 @@ class Sim:
                 self.creatures[0][c].icons[i] = self.creatures[0][c].drawIcon(self.ui.ICON_DIM[i], self.ui.MOSAIC_COLOR, self.beat_fade_time)
             
         self.ui.drawCreatureMosaic(0)
+
         
     def createNewCreature(self, idNumber):
         dna = np.clip(np.random.normal(0.0, 1.0, self.trait_count),-3,3)
+        self.creature_generations[idNumber] = 0
         return Creature(dna, idNumber, -1, self, self.ui)
         
     def getCalmStates(self, gen, startIndex, endIndex, frameCount, calmingRun):
@@ -144,6 +150,150 @@ class Sim:
         if calmingRun: # If it's a calming run, then take the average location of all nodes to center it at the origin.
             nodeCoor[:,:,:,0] -= np.mean(nodeCoor[:,:,:,0], axis=(1,2), keepdims=True)
         return nodeCoor, muscles, startCurrentFrame+frameCount  
+    
+    # Add this method to Sim class
+    def sample_biased_id(max_id):
+        """
+        Sample an ID from 0 to max_id where 0 has the highest probability
+        and max_id has the lowest.
+        
+        Args:
+            max_id (int): The maximum ID value (inclusive)
+        
+        Returns:
+            int: A sampled ID with bias toward lower values
+        """
+        # Generate random value with exponential distribution (more bias toward 0)
+        x = np.random.exponential(scale=max_id/10)
+        
+        # Clip the value to our range and convert to integer
+        selected_id = int(np.clip(x, 0, max_id))
+    
+        return selected_id
+    
+    def sample_weighted_creature_index(self, rankings, exclude_indices=None, weights = None):
+        """
+        Sample a creature index with probability weighted by its ranking.
+        Higher ranked creatures (lower rank number) have higher probability of being selected.
+        
+        Parameters:
+        - rankings: The array of creature indices sorted by fitness (highest first)
+        - exclude_indices: Indices to exclude from selection (e.g., to avoid self-mating)
+        
+        Returns:
+        - The selected creature index
+        """
+        if exclude_indices is None:
+            exclude_indices = []
+        
+        # Create weights inversely proportional to rank
+        if weights is None:
+            weights = np.array([max(0.03, 1.0 - (r / len(rankings))) for r in range(len(rankings))])
+        
+        # Zero out excluded indices
+        for idx in exclude_indices:
+            if 0 <= idx < len(weights):
+                weights[idx] = 0
+        
+        # Normalize weights
+        if np.sum(weights) > 0:
+            weights = weights / np.sum(weights)
+        else:
+            # If all weights are zero, use uniform distribution among non-excluded indices
+            weights = np.ones(len(rankings))
+            for idx in exclude_indices:
+                if 0 <= idx < len(weights):
+                    weights[idx] = 0
+            weights = weights / np.sum(weights)
+        
+        # Sample from the distribution
+        selected_rank = np.random.choice(len(rankings), p=weights)
+        return rankings[selected_rank]
+    
+    def are_creatures_compatible(self, creature1: Creature, creature2: Creature):
+        """
+        Determine if two creatures are compatible for sexual reproduction.
+        They should be genetically similar but not identical, and preferably of the same species.
+        """
+        if creature1.species != creature2.species:
+            return False
+        
+        if creature1.max_offspring <= creature1.generation_offspring or creature2.max_offspring <= creature2.generation_offspring:
+            return False
+        
+        similarity = creature1.calculate_dna_similarity(creature2)
+        
+        # Creatures must be somewhat similar but not identical
+        if similarity < 0.7 or similarity == 1.0:
+            return False
+        
+        # Creatures of the same species are always compatible if they meet similarity criteria
+
+            
+        # Different species might still be compatible if they're genetically similar enough
+        # This allows for occasional cross-species breeding
+        # if similarity > 0.85:
+        #     return True
+            
+        return True
+    
+    def sexual_reproduce(self, parent1: Creature, parent2: Creature, child_id):
+        """
+        Perform sexual reproduction between two creatures, creating a child with mixed DNA.
+        """
+        self.logger.info(f"Performing sexual reproduction. P1: {parent1} P2: {parent2}")
+        # Get DNA from both parents
+        dna1 = parent1.dna
+        dna2 = parent2.dna
+        
+        # Create child DNA through recombination
+        # We'll use a simple crossover method with some random variation
+        child_dna = np.zeros_like(dna1)
+        choice_array = np.random.random(dna1.shape)
+        # Create masks for each inheritance type
+        parent1_mask = (choice_array < 0.4)
+        parent2_mask = (choice_array >= 0.4) & (choice_array < 0.8)
+        blend_mask = (choice_array >= 0.8)
+        
+        child_dna[parent1_mask] = dna1[parent1_mask]
+        child_dna[parent2_mask] = dna2[parent2_mask]
+        child_dna[blend_mask] = (dna1[blend_mask] + dna2[blend_mask]) / 2.0
+            
+        # Add small random mutations
+        mutation = np.clip(np.random.normal(0.0, 0.5, child_dna.shape[0]), -1, 1)  # Smaller mutations than regular mutation
+        child_dna += self.mutation_rate * 0.5 * mutation  # Half the normal mutation rate
+        
+        # Determine child's species
+        # Usually, child inherits species from the more fit parent
+        # But occasionally, a new species emerges
+        # if random.random() < 0.05: # DOES NOTHING
+        #     # new_species = self.species_count
+        #     # self.species_count += 1
+        #     # # Create new creature with new species
+        #     # self.logger.info(f"Creating new species. Reason: Why not. ID: {new_species}")
+        #     # child = Creature(child_dna, child_id, new_species, self, self.ui)
+        #     # # Create new species info record
+        #     # more_fit_parent = parent1 if parent1.fitness > parent2.fitness else parent2
+        #     # self.species_info.append(SpeciesInfo(self, child, more_fit_parent))
+        #     parent_species = parent1.species if parent1.fitness > parent2.fitness else parent2.species
+        #     child = Creature(child_dna, child_id, parent_species, self, self.ui)
+        # else:
+        #     # Inherit species from more fit parent
+        species = parent1.species if parent1.fitness > parent2.fitness else parent2.species
+
+        generation = len(self.creatures) - 1
+        self.creature_generations[child_id] = generation
+        parent1.generation_offspring += 1
+        parent2.generation_offspring += 1
+        if parent1.check_if_new_species(child_dna):
+            species = self.species_count
+            self.species_count += 1
+            child = Creature(child_dna, child_id, species, self, self.ui)
+            self.species_info.append(SpeciesInfo(self, child, parent1, generation=generation))
+        else:
+            child = Creature(child_dna, child_id, species, self, self.ui)
+
+        return child
         
     def doSpeciesInfo(self,nsp,best_of_each_species):
         nsp = dict(sorted(nsp.items()))
@@ -165,7 +315,6 @@ class Sim:
     def checkALAP(self):
         if self.ui.ALAPButton.setting == 1: # We're already ALAP-ing!
             self.doGeneration(self.ui.doGenButton)
-        
     def doGeneration(self, button):
         generation_start_time = time.time() #calculates how long each generation takes to run
         
@@ -175,10 +324,12 @@ class Sim:
         finalScores = nodeCoor[:,:,:,0].mean(axis=(1, 2)) # find each creature's average X-coordinate
         
         # Tallying up all the data
-        currRankings = np.flip(np.argsort(finalScores),axis=0)
+        currRankings = np.flip(np.argsort(finalScores), axis=0)
         newPercentiles = np.zeros((self.HUNDRED+1))
         newSpeciesPops = {}
         best_of_each_species = {}
+        
+        # Set fitness and rank for each creature
         for rank in range(self.c_count):
             c = currRankings[rank]
             self.creatures[gen][c].fitness = finalScores[c]
@@ -188,62 +339,135 @@ class Sim:
             if species in newSpeciesPops:
                 newSpeciesPops[species][0] += 1
             else:
-                newSpeciesPops[species] = [1,None,None]
+                newSpeciesPops[species] = [1, None, None]
             if species not in best_of_each_species:
                 best_of_each_species[species] = self.creatures[gen][c].IDNumber
-        self.doSpeciesInfo(newSpeciesPops,best_of_each_species)
+        
+        self.doSpeciesInfo(newSpeciesPops, best_of_each_species)
 
+        # Calculate percentiles
         for p in range(self.HUNDRED+1):
-            rank = min(int(self.c_count*p/self.HUNDRED),self.c_count-1)
+            rank = min(int(self.c_count*p/self.HUNDRED), self.c_count-1)
             c = currRankings[rank]
             newPercentiles[p] = self.creatures[gen][c].fitness
         
+        # Prepare for reproduction
         currCreatures = self.creatures[-1]
-        nextCreatures = [None]*self.c_count
-        for rank in range(self.c_count//2):
-            winner = currRankings[rank]
-            loser = currRankings[(self.c_count-1)-rank]
-            if random.uniform(0,1) < rank/self.c_count:
-                ph = loser
-                loser = winner
-                winner = ph
-            nextCreatures[winner] = None
-            if random.uniform(0,1) < rank/self.c_count*2.0:  # A 1st place finisher is guaranteed to make a clone, but as we get closer to the middle the odds get more likely we just get 2 mutants.
-                nextCreatures[winner] = self.mutate(self.creatures[gen][winner],(gen+1)*self.c_count+winner)
-            else:
-                nextCreatures[winner] = self.clone(self.creatures[gen][winner],(gen+1)*self.c_count+winner)
-            nextCreatures[loser] = self.mutate(self.creatures[gen][winner],(gen+1)*self.c_count+loser)
-            self.creatures[gen][loser].living = False
+        nextCreatures = [None] * self.c_count
         
+        # Keep track of parents that have already reproduced
+        reproduction_count = np.zeros(self.c_count, dtype=int)
+
+        for c in range(self.c_count):
+            self.creatures[gen][c].living = False
+        
+        weights = np.array([max(0.03, 1.0 - (r / len(currCreatures))) for r in range(len(currCreatures))])
+        # Fill the new generation with offspring
+        for new_idx in range(self.c_count):
+            # Choose a parent with weighted probability based on rank
+            parent_creature_idx = self.sample_weighted_creature_index(currRankings, weights=weights)
+            parent_creature = self.creatures[gen][parent_creature_idx]
+            reproduced = False
+            species_individuals = newSpeciesPops[parent_creature.species][0]
+            # Choose reproduction method - 80% chance for sexual, 20% for asexual
+            # This is independent of creature's rank
+            if random.random() < 0.8:  # Try sexual reproduction
+                # Find compatible mates
+                potential_mates = []
+                # Try to find up to 5 compatible mates
+                for _ in range(self.c_count // 2):  # Try out population//10 times to find compatible mates
+                    if species_individuals < 2:
+                        # Only a single individual, nothing to check
+                        break
+                    # Sample potential mate with preference for higher fitness
+                    mate_idx = self.sample_weighted_creature_index(currRankings, [parent_creature_idx], weights=weights)
+                    mate_creature = self.creatures[gen][mate_idx]
+                    
+                    if self.are_creatures_compatible(parent_creature, mate_creature):
+                        potential_mates.append(mate_idx)
+                        if len(potential_mates) >= 1:
+                            break
+                
+                if potential_mates:
+                    # Choose one of the compatible mates randomly
+                    mate_idx = random.choice(potential_mates)
+                    mate_creature = self.creatures[gen][mate_idx]
+                    
+                    # Create offspring through sexual reproduction
+                    nextCreatures[new_idx] = self.sexual_reproduce(
+                        parent_creature, 
+                        mate_creature,
+                        (gen+1) * self.c_count + new_idx
+                    )
+                    
+                    # Increment reproduction counters
+                    reproduction_count[parent_creature_idx] += 1
+                    reproduction_count[mate_idx] += 1
+                    reproduced = True
+                    mate_creature.living = True
+                    continue
+            
+            # If sexual reproduction wasn't chosen or failed, do asexual reproduction
+            # 30% chance for cloning, 70% for mutation unless less than 4 individuals alive, then favor cloning
+            if not reproduced:
+                if (random.random() * min(species_individuals, 4) / 4.0)  < 0.3:
+                    nextCreatures[new_idx] = self.clone(
+                        parent_creature, 
+                        (gen+1) * self.c_count + new_idx
+                    )
+                    parent_creature
+                else:
+                    nextCreatures[new_idx] = self.mutate(
+                        parent_creature, 
+                        (gen+1) * self.c_count + new_idx
+                )
+            
+                # Increment reproduction counter
+                reproduction_count[parent_creature_idx] += 1
+                parent_creature.living = True
+        
+        # Add the new generation to the simulation
         self.creatures.append(nextCreatures)
-        self.rankings = np.append(self.rankings,currRankings.reshape((1,self.c_count)),axis=0)
-        self.percentiles = np.append(self.percentiles,newPercentiles.reshape((1,self.HUNDRED+1)),axis=0)
+        self.rankings = np.append(self.rankings, currRankings.reshape((1, self.c_count)), axis=0)
+        self.percentiles = np.append(self.percentiles, newPercentiles.reshape((1, self.HUNDRED+1)), axis=0)
         self.species_pops.append(newSpeciesPops)
-        
+        graph_start = time.time()
         drawAllGraphs(self, self.ui)
+        graph_end = time.time()
         
-        self.getCalmStates(gen+1,0,self.c_count,self.stabilization_time,True)
-        #Calm the creatures down so no potential energy is stored
+        # Calm the creatures down so no potential energy is stored
+        self.getCalmStates(gen+1, 0, self.c_count, self.stabilization_time, True)
         for c in range(self.c_count):
             for i in range(2):
-                self.creatures[gen+1][c].icons[i] = self.creatures[gen+1][c].drawIcon(self.ui.ICON_DIM[i], self.ui.MOSAIC_COLOR, self.beat_fade_time)
-  
+                self.creatures[gen+1][c].icons[i] = self.creatures[gen+1][c].drawIcon(
+                    self.ui.ICON_DIM[i], 
+                    self.ui.MOSAIC_COLOR, 
+                    self.beat_fade_time
+                )
+        
+        # Update UI
         self.ui.genSlider.val_max = gen+1
         self.ui.genSlider.manualUpdate(gen)
-        self.last_gen_run_time = time.time()-generation_start_time
+        self.last_gen_run_time = time.time() - generation_start_time
         
         self.ui.detectMouseMotion()
-        
+        self.checkALAP()
+        self.logger.info(f"Graph draw time: {graph_end - graph_start}s")
+ 
     def getCreatureWithID(self, ID):
         return self.creatures[ID//self.c_count][ID%self.c_count]
         
     def clone(self, parent, newID):
+        generation = len(self.creatures) - 1
+        self.creature_generations[newID] = generation
         return Creature(parent.dna, newID, parent.species, self, self.ui)
         
     def mutate(self, parent, newID):
         newDNA, newSpecies, cwc = parent.getMutatedDNA(self)
         newCreature = Creature(newDNA, newID, newSpecies, self, self.ui)
+        generation = len(self.creatures) - 1
+        self.creature_generations[newID] = generation
         if newCreature.species != parent.species:
-            self.species_info.append(SpeciesInfo(self,newCreature,parent))
+            self.species_info.append(SpeciesInfo(self, newCreature, parent, generation=generation))
             newCreature.codonWithChange = cwc
         return newCreature
