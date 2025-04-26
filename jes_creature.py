@@ -9,7 +9,7 @@ import random
 import logging
 
 class Creature:
-    def __init__(self,d,pIDNumber,parent_species,_sim,_ui, max_offspring=4, logger=None, mutate_rate=0.2):
+    def __init__(self,d,pIDNumber,parent_species,_sim,_ui, max_offspring=4, logger=None, mutate_rate=0.05):
         self.logger = logger or logging.getLogger(__name__)
         self.dna = d
         self.calmState = None
@@ -25,8 +25,6 @@ class Creature:
         self.codonWithChange = None
         self.max_offspring = max_offspring
         self.generation_offspring = 0
-        self.species_threshold = 0.95
-        self.mutate_rate = mutate_rate
 
     def __str__(self):
         return f"ID: {self.IDNumber:<5} S: {str(self.sim.species_info[self.species]):<10}  OG: {self.generation_offspring:<4}"
@@ -111,7 +109,7 @@ class Creature:
         species_rep_dna = self.sim.getCreatureWithID(sp_info.reps[1]).dna
 
         new_creature_similarity = self.calculate_raw_dna_similarity(species_rep_dna, other_dna)
-        if new_creature_similarity < self.species_threshold:
+        if new_creature_similarity < self.sim.species_threshold:
             self.logger.info(f"Creating new species, as offspring similarity is below threshold: {new_creature_similarity}")
             return True
         return False
@@ -119,8 +117,8 @@ class Creature:
         
     def getMutatedDNA(self, sim):
         mutation = np.clip(np.random.normal(-1.0, 1.0, self.dna.shape[0]),-99,99)
-        mutation_mask = np.random.random(self.dna.shape) < self.mutate_rate
-        result = self.dna + sim.mutation_rate*mutation * mutation_mask
+        mutation_mask = np.random.random(self.dna.shape) < sim.mutation_rate
+        result = self.dna + sim.mutation_size * mutation * mutation_mask
         newSpecies = self.species
         
         big_mut_loc = 0
@@ -132,8 +130,7 @@ class Creature:
             return result, newSpecies, big_mut_loc
 
         if random.uniform(0,1) < self.sim.big_mutation_rate: # do a big mutation
-            newSpecies = sim.species_count
-            sim.species_count += 1
+
             cell_x = random.randint(0,self.sim.CW-1)
             cell_y = random.randint(0,self.sim.CH-1)
             cell_beat = random.randint(0,self.sim.beats_per_cycle-1)
@@ -142,13 +139,17 @@ class Creature:
             for i in range(self.sim.traits_per_box):
                 delta = 0
                 while abs(delta) < 0.5:
-                    delta = np.random.normal(0.0, 1.0, 1)
+                    delta = np.random.normal(-1.0, 1.0, 1)
                 result[big_mut_loc+i] += delta
                 
                 #Cells that endure a big mutation are also required to be at least somewhat rigid, because if a cell goes from super-short to super-tall but has low rigidity the whole time, then it doesn't really matter.
                 if i == 2 and result[big_mut_loc+i] < 0.5:
                     result[big_mut_loc+i] = 0.5
-        
+            
+        if self.check_if_new_species(result):
+            newSpecies = sim.species_count
+            sim.species_count += 1
+
         return result, newSpecies, big_mut_loc
     def calculate_dna_similarity(self, other_creature):
         """

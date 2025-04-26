@@ -12,7 +12,7 @@ class Sim:
     _beat_fade_time, _c_dim, _beats_per_cycle, _node_coor_count,
     _y_clips, _ground_friction_coef, _gravity_acceleration_coef,
     _calming_friction_coef, _typical_friction_coef, _muscle_coef,
-    _traits_per_box, _traits_extra, _mutation_rate, _big_mutation_rate, _UNITS_PER_METER, logger=None):
+    _traits_per_box, _traits_extra, mutation_size, big_mutation_size, _UNITS_PER_METER, logger=None, mutation_rate=0.05, big_mutation_rate=0.1, species_threshold=0.95, sexual_reproduction_chance=0.75):
         self.logger = logger or logging.getLogger(__name__)
 
         self.c_count = _c_count #creature count
@@ -36,8 +36,16 @@ class Sim:
         self.traits_extra = _traits_extra
         self.trait_count = self.CW*self.CH*self.beats_per_cycle*self.traits_per_box+self.traits_extra
         
-        self.mutation_rate = _mutation_rate
-        self.big_mutation_rate = _big_mutation_rate
+        self.mutation_size = mutation_size
+        self.big_mutation_size = big_mutation_size
+
+        self.mutation_rate = mutation_rate
+        self.big_mutation_rate = big_mutation_rate
+
+        self.species_threshold = species_threshold
+
+        self.sexual_reproduction_chance = sexual_reproduction_chance
+        self.average_reproductions_per_creature = 1.1
         
         self.S_VISIBLE = 0.05 #what proportion of the population does a species need to appear on the SAC graph?
         self.S_NOTABLE = 0.10 #what proportion of the population does a species need to appear in the genealogy?
@@ -218,13 +226,13 @@ class Sim:
         if creature1.species != creature2.species:
             return False
         
-        if creature1.max_offspring <= creature1.generation_offspring or creature2.max_offspring <= creature2.generation_offspring:
-            return False
+        # if creature1.max_offspring <= creature1.generation_offspring or creature2.max_offspring <= creature2.generation_offspring:
+        #     return False
         
         similarity = creature1.calculate_dna_similarity(creature2)
         
-        # Creatures must be somewhat similar but not identical
-        if similarity < 0.7 or similarity == 1.0:
+        # Creatures must be somewhat similar
+        if similarity < 0.85:
             return False
         
         # Creatures of the same species are always compatible if they meet similarity criteria
@@ -258,10 +266,12 @@ class Sim:
         child_dna[parent1_mask] = dna1[parent1_mask]
         child_dna[parent2_mask] = dna2[parent2_mask]
         child_dna[blend_mask] = (dna1[blend_mask] + dna2[blend_mask]) / 2.0
+
+        mutate_mask = np.random.random(dna1.shape) < self.mutation_rate
             
         # Add small random mutations
-        mutation = np.clip(np.random.normal(0.0, 0.5, child_dna.shape[0]), -1, 1)  # Smaller mutations than regular mutation
-        child_dna += self.mutation_rate * 0.5 * mutation  # Half the normal mutation rate
+        mutation = np.clip(np.random.normal(-1.0, 1.0, child_dna.shape[0]), -99, 99)
+        child_dna += self.mutation_size * 0.5 * mutation * mutate_mask  # Half the normal mutation size
         
         # Determine child's species
         # Usually, child inherits species from the more fit parent
@@ -315,6 +325,59 @@ class Sim:
     def checkALAP(self):
         if self.ui.ALAPButton.setting == 1: # We're already ALAP-ing!
             self.doGeneration(self.ui.doGenButton)
+
+
+    def sample_weighted_by_species(self, creature_matrix, species_id, max_reproductions=2, excluded_indices=None, sample_size=10):
+        """
+        Sample indices weighted by fitness from creatures of a specific species.
+        
+        Args:
+            creature_matrix: NumPy array with shape (n, 3) where:
+                - column 0 is species ID
+                - column 1 is fitness
+                - column 2 is reproduction count
+            species_id: The species ID to sample from
+            max_reproductions: Maximum number of times a creature can reproduce
+            excluded_indices: Optional list/array of indices to exclude from sampling
+            
+        Returns:
+            Index of the sampled creature, or None if no valid creatures found
+        """
+        # Filter by species and reproduction count
+        valid_mask = (creature_matrix[:, 0] == species_id) & (creature_matrix[:, 2] < max_reproductions)
+        
+        # Also filter out excluded indices if provided
+        if excluded_indices is not None:
+            # Create a mask of indices to exclude (True for positions to exclude)
+            exclude_mask = np.zeros(len(creature_matrix), dtype=bool)
+            exclude_mask[excluded_indices] = True
+            # Update valid_mask to exclude these indices
+            valid_mask = valid_mask & ~exclude_mask
+        
+        valid_indices = np.where(valid_mask)[0]
+        
+        # Return None if no valid creatures
+        if len(valid_indices) == 0:
+            return None
+        
+        # Determine actual sample size (can't sample more than available)
+        actual_sample_size = min(sample_size, len(valid_indices))
+        
+        # Get fitness values for valid creatures
+        fitness_values = creature_matrix[valid_indices, 1]
+        
+        # Apply softmax-like normalization to exaggerate differences
+        temperature = 1.0
+        weights = np.exp(fitness_values / temperature)
+        
+        # Normalize to get probabilities
+        probabilities = weights / np.sum(weights)
+        
+        # Sample based on probabilities
+        sampled_indices = np.random.choice(valid_indices, size=actual_sample_size, p=probabilities, replace=False)
+        
+        return sampled_indices
+
     def doGeneration(self, button):
         generation_start_time = time.time() #calculates how long each generation takes to run
         
@@ -355,42 +418,58 @@ class Sim:
         currCreatures = self.creatures[-1]
         nextCreatures = [None] * self.c_count
         
-        # Keep track of parents that have already reproduced
-        reproduction_count = np.zeros(self.c_count, dtype=int)
 
         for c in range(self.c_count):
             self.creatures[gen][c].living = False
         
         weights = np.array([max(0.03, 1.0 - (r / len(currCreatures))) for r in range(len(currCreatures))])
         # Fill the new generation with offspring
+        creature_species_matrix = np.zeros((self.c_count, 3), dtype=int)
+        for c in range(self.c_count):
+            creature = self.creatures[gen][c]
+            creature_species_matrix[c, 0] = creature.species
+            creature_species_matrix[c, 1] = creature.fitness
+            creature_species_matrix[c, 2] = 0 # Times reproduced already
+
         for new_idx in range(self.c_count):
             # Choose a parent with weighted probability based on rank
             parent_creature_idx = self.sample_weighted_creature_index(currRankings, weights=weights)
+            # make sure we don't reproduce too much
+            while creature_species_matrix[parent_creature_idx, 2] + 1 >= self.average_reproductions_per_creature:
+                if creature_species_matrix[parent_creature_idx, 2] - 1 < self.average_reproductions_per_creature:
+                    if random.random() < 0.2:
+                        break
+                parent_creature_idx = self.sample_weighted_creature_index(currRankings, weights=weights)
+                    
             parent_creature = self.creatures[gen][parent_creature_idx]
             reproduced = False
-            species_individuals = newSpeciesPops[parent_creature.species][0]
-            # Choose reproduction method - 80% chance for sexual, 20% for asexual
-            # This is independent of creature's rank
-            if random.random() < 0.8:  # Try sexual reproduction
+            # Choose reproduction method
+            if random.random() < self.sexual_reproduction_chance:  # Try sexual reproduction
                 # Find compatible mates
-                potential_mates = []
-                # Try to find up to 5 compatible mates
-                for _ in range(self.c_count // 2):  # Try out population//10 times to find compatible mates
-                    if species_individuals < 2:
-                        # Only a single individual, nothing to check
-                        break
-                    # Sample potential mate with preference for higher fitness
-                    mate_idx = self.sample_weighted_creature_index(currRankings, [parent_creature_idx], weights=weights)
-                    mate_creature = self.creatures[gen][mate_idx]
-                    
-                    if self.are_creatures_compatible(parent_creature, mate_creature):
-                        potential_mates.append(mate_idx)
-                        if len(potential_mates) >= 1:
-                            break
+                # Sample potential mates with preference for higher fitness
+                potential_mates_sample = self.sample_weighted_by_species(
+                        creature_matrix=creature_species_matrix,
+                        species_id=creature_species_matrix[parent_creature_idx][0],
+                        max_reproductions=int(self.average_reproductions_per_creature*10),
+                        excluded_indices=parent_creature_idx,
+                        sample_size=1
+                )
+                # if potential_mates_sample is None:
+                #     potential_mates_sample = []
+                # No need to check compatibility, species must be compatible between itself
+                # for mate_idx in potential_mates_sample:
+                #     mate_creature = self.creatures[gen][mate_idx]
+                #     self.logger.info(f"Checking creature compatibility: {parent_creature} | {mate_creature}")
+                #     self.logger.info(f"Checking creature compatibility: {parent_creature.fitness} | {mate_creature.fitness}")
+
+                #     if self.are_creatures_compatible(parent_creature, mate_creature):
+                #         potential_mates.append(mate_idx)
+                        # if len(potential_mates) >= 1:
+                        #     break
                 
-                if potential_mates:
+                if potential_mates_sample is not None:
                     # Choose one of the compatible mates randomly
-                    mate_idx = random.choice(potential_mates)
+                    mate_idx = random.choice(potential_mates_sample)
                     mate_creature = self.creatures[gen][mate_idx]
                     
                     # Create offspring through sexual reproduction
@@ -401,16 +480,19 @@ class Sim:
                     )
                     
                     # Increment reproduction counters
-                    reproduction_count[parent_creature_idx] += 1
-                    reproduction_count[mate_idx] += 1
+                    creature_species_matrix[parent_creature_idx, 2] += 1
+                    # We're the ones giving birth, mate just added genetic material
+                    # creature_species_matrix[mate_idx, 2] += 1
                     reproduced = True
                     mate_creature.living = True
+                    parent_creature.living = True
                     continue
             
             # If sexual reproduction wasn't chosen or failed, do asexual reproduction
             # 30% chance for cloning, 70% for mutation unless less than 4 individuals alive, then favor cloning
             if not reproduced:
-                if (random.random() * min(species_individuals, 4) / 4.0)  < 0.3:
+                species_individuals_num = (creature_species_matrix[:, 0] == parent_creature.species).sum()
+                if (random.random() * min(species_individuals_num, 4) / 4.0)  < 0.3:
                     nextCreatures[new_idx] = self.clone(
                         parent_creature, 
                         (gen+1) * self.c_count + new_idx
@@ -423,7 +505,7 @@ class Sim:
                 )
             
                 # Increment reproduction counter
-                reproduction_count[parent_creature_idx] += 1
+                creature_species_matrix[parent_creature_idx, 2] += 1
                 parent_creature.living = True
         
         # Add the new generation to the simulation
